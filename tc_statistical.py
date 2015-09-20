@@ -648,18 +648,23 @@ class StatisticalInspect(object):
         #***  classification:
         _max_packets = 5
         #*** Thresholds used in calculations:
-        # _max_packet_size_threshold = 1200
-        # _interpacket_ratio_threshold = 0.25
+        _max_packet_size_threshold = 1200
+        _interpacket_ratio_threshold = 0.25
         #*** Initialise variables
         _continue_to_inspect = True
         _actions = 0
         _pkt_udp = pkt.get_protocol(udp.udp)
+        _pkt_ipv4 = pkt.get_protocol(ipv4.ipv4)
+        print _pkt_ipv4.src, _pkt_ipv4.src 
         if not _pkt_udp:
             return {'valid':True, 'continue_to_inspect':False, 
                     'actions':_actions}
-        if not isinstance(_pkt_udp, udp.udp):
-            return {'valid':True, 'continue_to_inspect':False, 
-                    'actions':_actions}
+        # if not isinstance(_pkt_udp, udp.udp):
+        #     return {'valid':True, 'continue_to_inspect':False, 
+        #             'actions':_actions}
+        _pkt_ipv4 = pkt.get_protocol(ipv4.ipv4)
+        if _pkt_ipv4.dst == '111.221.121.147':
+            print pkt
         #*** It is UDP, check if it's part of a flow we're already classifying:
         _table_ref = self._udp_fcip_check(pkt)
         self.logger.debug("Table ref is %s", _table_ref)
@@ -674,33 +679,59 @@ class StatisticalInspect(object):
                 if _flow_packet_count > (_max_packets - 1):
                     #*** Reached our maximum packet count so do some classification:
                     self.logger.debug("Reached max packets count")
-                    self.logger.info("finalised")
-                    # self.logger.info(self._fcip_table[_table_ref])
                     #*** Set the flow to be finalised so no more packets will be added: 
                     self._fcip_finalise(_table_ref)
                     #*** Set result value to say that flow can be installed to switch now
                     #*** as we don't need to see any more packets to classify it:
                     _continue_to_inspect = False                        
-                    #*** Decide actions based on the statistics:
-                    #*** For Bit Torrent Traffic
-                    _count_bt = 0
-                    for length in self._fcip_table[_table_ref]["ip_total_length"].values():
-                        if length == 48: _count_bt += 1
-                    if _count_bt > 2:
-                        #*** It looks like Bit Torrent Traffic
-                        self.logger.info("I Got Bit Torrent Traffic")
-                        _actions = { 'set_qos_tag': "QoS_treatment=low_priority" }
-                    #*** For Skype Traffic setup call
-                    _count_skype = 0
-                    for length in self._fcip_table[_table_ref]["ip_total_length"].values():
-                        if length == 31 or length == 56: _count_skype += 1
-                    if _count_skype > 2:
-                        #*** It looks like it will be a Skype Traffic
-                        self.logger.info("I Got Skype Traffic")
-                        _actions = { 'set_qos_tag': "QoS_treatment=default_priority" }
+                    #*** Call functions to get statistics to make decisions on:
+                    #*** The max packet sizes are for each directions: forward and reverse
+                    _max_packet_size = self._udp_calc_max_packet_size(_table_ref)
+                    _max_interpacket_interval = self._udp_calc_max_interpacket_interval(_table_ref)
+                    _min_interpacket_interval = self._udp_calc_min_interpacket_interval(_table_ref)
+                    #*** Avoid possible divide by zero error:
+                    if (_max_interpacket_interval and _min_interpacket_interval):
+                        #*** Ratio between largest directional interpacket delta and smallest
+                        #*** Use a ratio as it accounts for base RTT:
+                        _interpacket_ratio = nmisc.AutoVivification()
+                        _interpacket_ratio['both'] = float(_min_interpacket_interval['both'])\
+                                                / float(_max_interpacket_interval['both'])
+                        try:
+                            _interpacket_ratio['forward'] = float(_min_interpacket_interval['forward'])\
+                                                    / float(_max_interpacket_interval['forward'])
+                        except:
+                            _interpacket_ratio['forward'] = None
+                        try:
+                            _interpacket_ratio['reverse'] = float(_min_interpacket_interval['reverse'])\
+                                                    / float(_max_interpacket_interval['reverse'])
+                        except:
+                            _interpacket_ratio['reverse'] = None
                     else:
-                        #*** Default action for other traffic type
-                        _actions = { 'set_qos_tag': "QoS_treatment=default_priority" }
+                        _interpacket_ratio = 0
+                    self.logger.info("###############################################################")
+                    self.logger.info("paket: %s", self._fcip_table[_table_ref])
+                    self.logger.info("_max_packet_size is %s", _max_packet_size['both'])
+                    self.logger.info("_interpacket_ratio is %s", _interpacket_ratio['both'])
+                    self.logger.info("###############################################################")
+                    self.logger.info("_max_packet_size['forward'] is %s", _max_packet_size['forward'])
+                    self.logger.info("_interpacket_ratio['forward'] is %s", _interpacket_ratio['forward'])
+                    self.logger.info("_max_interpacket_interval['forward'] is %s", _max_interpacket_interval['forward'])
+                    self.logger.info("_min_interpacket_interval['forward'] is %s", _min_interpacket_interval['forward'])
+                    self.logger.info("###############################################################")
+                    self.logger.info("_max_packet_size['reverse'] is %s", _max_packet_size['reverse'])
+                    self.logger.info("_interpacket_ratio['reverse'] is %s", _interpacket_ratio['reverse'])
+                    self.logger.info("_max_interpacket_interval['reverse'] is %s", _max_interpacket_interval['reverse'])
+                    self.logger.info("_min_interpacket_interval['reverse'] is %s", _min_interpacket_interval['reverse'])
+                    self.logger.info("###############################################################")
+                    #*** Decide actions based on the statistics:
+                    # if (_max_packet_size['both'] > _max_packet_size_threshold and 
+                    #         _interpacket_ratio < _interpacket_ratio_threshold):
+                        #*** This traffic looks like a bandwidth hog so set to low priority:
+                        # self.logger.debug("I guess thisi is p2p traffic")
+                        # _actions = { 'set_qos_tag': "QoS_treatment=low_priority" }
+                    # else:
+                        #*** Doesn't look like bandwidth hog so default priority:
+                    _actions = { 'set_qos_tag': "QoS_treatment=default_priority" }
                     self.logger.debug("Decided on actions %s", _actions)
                     #*** Install actions into table so that subsequent packets of same flow
                     #*** get same actions when seeing finalised entry:
@@ -977,3 +1008,4 @@ class StatisticalInspect(object):
         else:
             _min_interpacket['both'] = min(list(_min_interpacket.values()))
             return _min_interpacket
+
