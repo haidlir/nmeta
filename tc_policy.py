@@ -570,6 +570,14 @@ class TrafficClassificationPolicy(object):
             elif policy_attr == "match_type":
                 #*** Nothing to do:
                 pass
+
+            # haidlir's code
+            elif policy_attr_type == "statistical":
+                _match = self.statistical.check_statistical(policy_attr,
+                                                                  policy_value,
+                                                                  pkt)
+            # end of haidlir's code
+
             else:
                 #*** default to doing a Static Classification match:
                 _match = self.static.check_static(policy_attr,

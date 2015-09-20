@@ -31,6 +31,7 @@ from ryu.lib.packet import ethernet
 from ryu.lib.packet import lldp
 from ryu.lib.packet import ipv4
 from ryu.lib.packet import tcp
+from ryu.lib.packet import udp
 
 #*** nmeta imports:
 import nmisc
@@ -98,6 +99,9 @@ class StatisticalInspect(object):
             #*** call the function for this particular statistical classifier
             results_dict = self._statistical_qos_bandwidth_1(pkt)
             return results_dict
+        elif policy_attr == "statistical_voip_p2p":
+            results_dict = self._statistical_voip_p2p(pkt)
+            # return results_dict
         else:
             self.logger.error("Policy attribute "
                               "%s did not match", policy_attr)
@@ -208,7 +212,7 @@ class StatisticalInspect(object):
         _max_reverse = 0
         for _packet_number in self._fcip_table[table_ref]["window_size"]:
             _size = self._fcip_table[table_ref]["window_size"][_packet_number]
-            _direction = self._fcip_table[table_ref]["direction"][_packet_number]            
+            _direction = self._fcip_table[table_ref]["direction"][_packet_number]
             if _direction == "forward":
                 if not _first_forward:
                     _first_forward = _size
@@ -635,3 +639,341 @@ class StatisticalInspect(object):
         #*** Now iterate over the list of references to delete:
         for _del_ref in _for_deletion:
             del self._fcip_table[_del_ref]
+
+    def _statistical_voip_p2p(self, pkt):
+        """
+        Statistical Classifier for VoIP and P2P Traffic
+        """
+        #*** Maximum packets to accumulate in a flow before making a 
+        #***  classification:
+        _max_packets = 5
+        #*** Thresholds used in calculations:
+        # _max_packet_size_threshold = 1200
+        # _interpacket_ratio_threshold = 0.25
+        #*** Initialise variables
+        _continue_to_inspect = True
+        _actions = 0
+        _pkt_udp = pkt.get_protocol(udp.udp)
+        if not _pkt_udp:
+            return {'valid':True, 'continue_to_inspect':False, 
+                    'actions':_actions}
+        if not isinstance(_pkt_udp, udp.udp):
+            return {'valid':True, 'continue_to_inspect':False, 
+                    'actions':_actions}
+        #*** It is UDP, check if it's part of a flow we're already classifying:
+        _table_ref = self._udp_fcip_check(pkt)
+        self.logger.debug("Table ref is %s", _table_ref)
+        if _table_ref:
+            #*** It's a flow that we are classifying. Update the table and
+            #*** check if we have enough data to make a classification.
+            #*** Check that the flow hasn't been finalised:
+            if not self._fcip_is_finalised(_table_ref):
+                #*** Not finalised so add to table row:
+                _flow_packet_count = self._udp_fcip_add_to_existing(pkt, _table_ref)
+                #*** Note that _flow_packet_count will be 0 if a duplicate packet
+                if _flow_packet_count > (_max_packets - 1):
+                    #*** Reached our maximum packet count so do some classification:
+                    self.logger.debug("Reached max packets count")
+                    self.logger.info("finalised")
+                    # self.logger.info(self._fcip_table[_table_ref])
+                    #*** Set the flow to be finalised so no more packets will be added: 
+                    self._fcip_finalise(_table_ref)
+                    #*** Set result value to say that flow can be installed to switch now
+                    #*** as we don't need to see any more packets to classify it:
+                    _continue_to_inspect = False                        
+                    #*** Decide actions based on the statistics:
+                    #*** For Bit Torrent Traffic
+                    _count_bt = 0
+                    for length in self._fcip_table[_table_ref]["ip_total_length"].values():
+                        if length == 48: _count_bt += 1
+                    if _count_bt > 2:
+                        #*** It looks like Bit Torrent Traffic
+                        self.logger.info("I Got Bit Torrent Traffic")
+                        _actions = { 'set_qos_tag': "QoS_treatment=low_priority" }
+                    #*** For Skype Traffic setup call
+                    _count_skype = 0
+                    for length in self._fcip_table[_table_ref]["ip_total_length"].values():
+                        if length == 31 or length == 56: _count_skype += 1
+                    if _count_skype > 2:
+                        #*** It looks like it will be a Skype Traffic
+                        self.logger.info("I Got Skype Traffic")
+                        _actions = { 'set_qos_tag': "QoS_treatment=default_priority" }
+                    else:
+                        #*** Default action for other traffic type
+                        _actions = { 'set_qos_tag': "QoS_treatment=default_priority" }
+                    self.logger.debug("Decided on actions %s", _actions)
+                    #*** Install actions into table so that subsequent packets of same flow
+                    #*** get same actions when seeing finalised entry:
+                    self._fcip_table[_table_ref]["actions"] = _actions
+            else:
+                #*** It's a finalised flow so we don't want to touch it,
+                #*** but we do want to grab the actions if there are any
+                _actions = self._fcip_table[_table_ref]["actions"]
+                return {'valid':True, 'continue_to_inspect':False, 
+                'actions':_actions}
+        else: 
+            #*** It's not a flow we're classifying so start a new entry:
+            self._udp_fcip_add_new(pkt)
+        return {'valid':True, 'continue_to_inspect':_continue_to_inspect, 
+                    'actions':_actions}
+
+    def _udp_fcip_check(self, pkt):
+        """
+        Checks if a packet is part of a flow in the
+        Flow Classification In Progress (FCIP) table.
+        Returns False if not in table.
+        Returns a table reference if it is in the table
+        """       
+        _pkt_ip4 = pkt.get_protocol(ipv4.ipv4)
+        _pkt_udp = pkt.get_protocol(udp.udp)
+        _ip_A = _pkt_ip4.src
+        _ip_B = _pkt_ip4.dst
+        _udp_A = _pkt_udp.src_port
+        _udp_B = _pkt_udp.dst_port
+        for _table_ref in self._fcip_table:
+            _ip_match = self._fcip_check_ip(_table_ref, _ip_A, _ip_B)
+            if _ip_match:
+                #*** Matched IP address pair in either direction
+                #*** Now check for UDP port match (with consideration to
+                #*** directionality):
+                _udp_match = self._fcip_check_udp(_table_ref, _ip_match, _udp_A, _udp_B)
+                if _udp_match:
+                    #*** Matched IP and UDP parameters so return
+                    #*** the table reference:
+                    self.logger.debug("Matched a flow "
+                                      "we're already classifying...")
+                    return _table_ref
+
+    def _fcip_check_udp(self, table_ref, ip_match, udp_A, udp_B):
+        """
+        Checks if source/destination udp ports match against
+        a given table entry same order that IP addresses matched 
+        in.
+        Returns True (1) for a match and False (0) for no match
+        """        
+        if (ip_match == 'forward' and udp_A == self._fcip_table[table_ref]["udp_A"]
+            and udp_B == self._fcip_table[table_ref]["udp_B"]):
+                return True
+        elif (ip_match == 'reverse' and udp_A == self._fcip_table[table_ref]["udp_B"]
+            and udp_B == self._fcip_table[table_ref]["udp_A"]):
+                return True
+        else:
+            return False
+
+    def _udp_fcip_add_to_existing(self, pkt, table_ref):
+        """
+        Passed a packet that is in a flow that we are
+        already classifying and a reference to the
+        Flow Classification In Progress (FCIP) table.
+        Return the packet number of this packet in
+        the flow.
+        """        
+        _pkt_ip4 = pkt.get_protocol(ipv4.ipv4)
+        _pkt_udp = pkt.get_protocol(udp.udp)
+        _ip_A = _pkt_ip4.src
+        _ip_B = _pkt_ip4.dst
+        if self._udp_fcip_check_duplicate(pkt, table_ref):
+            #*** It's a packet we've already seen - either a retransmission
+            #*** or the same packet from another switch along the data path
+            #*** so we'll ignore it:
+            if self.extra_debugging:
+                self.logger.debug("Ignoring duplicate packet")
+            return 0
+        #*** Work out what packet number we are in the flow:
+        _packet_number = self._fcip_table[table_ref]["number_of_packets"]
+        _packet_number += 1
+        self.logger.debug("_packet_number is %s", _packet_number)        
+        #*** Update number of packets:
+        self._fcip_table[table_ref]["number_of_packets"] = _packet_number
+        #*** Work out directionality and add to the table:
+        _direction = self._fcip_check_ip(table_ref, _ip_A, _ip_B)
+        self._fcip_table[table_ref]["direction"][_packet_number] = _direction
+        #*** This could do with improvement - would be subject to variability
+        #*** due to time taken for packet to reach the controller and processing
+        #*** time on the controller. But, it'll do for the moment:
+        self._fcip_table[table_ref]["arrival_time"][_packet_number] = time.time()
+        #*** Add packet size:
+        self._fcip_table[table_ref]["ip_total_length"][_packet_number] = _pkt_ip4.total_length
+        #*** Add UDP parameters like cheksum:
+        self._fcip_table[table_ref]["csum"][_packet_number] = _pkt_udp.csum
+        # self._fcip_table[table_ref]["udp_total_length"][_packet_number] = _pkt_udp.total_length -> (unnecessary)
+        if self.extra_debugging:
+            self.logger.debug("updated with packet %s: %s", 
+                              _packet_number, self._fcip_table[table_ref])
+            #*** Extra data for easy recording of statistical results for analysis charts:
+            _max_packet_size = self._calc_max_packet_size(table_ref)
+            self._fcip_table[table_ref]["max_packet_size"][_packet_number] = _max_packet_size
+            _min_interpacket_interval = self._calc_min_interpacket_interval(table_ref)
+            self._fcip_table[table_ref]["min_interpacket"][_packet_number] = _min_interpacket_interval
+            _calc_last_interpacket_interval = self._calc_last_interpacket_interval(table_ref)
+            self._fcip_table[table_ref]["last_interpacket"][_packet_number] = _calc_last_interpacket_interval
+        return _packet_number
+
+    def _udp_fcip_check_duplicate(self, pkt, table_ref):
+        """
+        Passed a packet that is in a flow that we are
+        already classifying and a reference to the FCIP
+        table row.
+        Check to see if this packet is a duplicate of
+        any of the packets already included in this table
+        row and if it is a duplicate return True otherwise
+        False
+        """        
+        _pkt_ip4 = pkt.get_protocol(ipv4.ipv4)
+        _pkt_udp = pkt.get_protocol(udp.udp)
+        #*** iterate through table row checking for duplicate values
+        for _packet_number in xrange(1, (self._fcip_table[table_ref]["number_of_packets"]+1)):
+            if (self._fcip_table[table_ref]["csum"][_packet_number] == _pkt_udp.csum):
+                if self.extra_debugging:
+                    self.logger.debug("DUPLICATE PACKET")
+                return True
+        return False
+
+    def _udp_fcip_add_new(self, pkt):
+        """
+        Passed a packet that is a new flow and add to the
+        Flow Classification In Progress (FCIP) table.
+        """
+
+        _pkt_ip4 = pkt.get_protocol(ipv4.ipv4)
+        _pkt_udp = pkt.get_protocol(udp.udp) 
+        #*** Direction for first packet is always forward:
+        self._fcip_table[self._fcip_ref]["direction"][1] = "forward"
+        #*** Initial setting of variable that stops more packets being added:
+        self._fcip_table[self._fcip_ref]["finalised"] = 0
+        #*** Allow actions to be stored for reference on finalised flows:
+        self._fcip_table[self._fcip_ref]["actions"] = 0
+        #*** Add the standard layer-3 and 4 values:
+        self._fcip_table[self._fcip_ref]["ip_A"] = _pkt_ip4.src
+        self._fcip_table[self._fcip_ref]["ip_B"] = _pkt_ip4.dst
+        self._fcip_table[self._fcip_ref]["udp_A"] = _pkt_udp.src_port
+        self._fcip_table[self._fcip_ref]["udp_B"] = _pkt_udp.dst_port        
+        #*** This could do with improvement - would be subject to variability
+        #*** due to time taken for packet to reach the controller and
+        #*** processing time on the controller. But, it'll do for the moment:
+        self._fcip_table[self._fcip_ref]["arrival_time"][1] = time.time()
+        #*** Add packet size:
+        self._fcip_table[self._fcip_ref]["ip_total_length"][1] = _pkt_ip4.total_length
+        #*** Add UDP parameters like checksum
+        self._fcip_table[self._fcip_ref]["csum"][1] = _pkt_udp.csum
+        #*** Number of packets is 1 as this is the first packet in the flow:
+        self._fcip_table[self._fcip_ref]["number_of_packets"] = 1
+        if self.extra_debugging:
+            self.logger.debug("added new: %s", 
+                               self._fcip_table[self._fcip_ref])
+        #*** increment table ref ready for next time we use it:
+        self._fcip_ref += 1
+
+    def _udp_calc_max_packet_size(self, table_ref):
+        """
+        Review packet sizes in a flow and return the largest one
+        for each direction
+        """
+        _max_size = nmisc.AutoVivification()
+        _max_size['forward'] = 0
+        _max_size['reverse'] = 0
+        for _packet_number in self._fcip_table[table_ref]["ip_total_length"]:
+            _size = self._fcip_table[table_ref]["ip_total_length"][_packet_number]
+            _direction = self._fcip_table[table_ref]["direction"][_packet_number]
+            if _size > _max_size[_direction]:
+                _max_size[_direction] = _size
+        _max_size['both'] = max(list(_max_size.values()))
+        return _max_size
+
+    def _udp_calc_max_interpacket_interval(self, table_ref):
+        """
+        Review packet arrival times for each direction in 
+        a flow and return the size of the largest inter-
+        packet interval (from either direction) in seconds
+        """
+        _max_interpacket = nmisc.AutoVivification()
+        _max_interpacket['forward'] = 0
+        _max_interpacket['reverse'] = 0
+        _previous_reverse = 0
+        _previous_forward = 0
+        for _packet_number in self._fcip_table[table_ref]["arrival_time"]:
+            _arrival_time = self._fcip_table[table_ref]["arrival_time"][_packet_number]
+            _direction = self._fcip_table[table_ref]["direction"][_packet_number]
+            if _direction == 'forward' and _previous_forward:
+                _interpacket_interval = _arrival_time - _previous_forward
+                if not _max_interpacket['forward']:
+                    _max_interpacket['forward'] = _interpacket_interval
+                elif _interpacket_interval > _max_interpacket['forward']:
+                    _max_interpacket['forward'] = _interpacket_interval
+                else:
+                    #*** nothing to see here, move on
+                    pass
+                _previous_forward = _arrival_time
+            elif _direction == 'reverse' and _previous_reverse:
+                _interpacket_interval = _arrival_time - _previous_reverse
+                if not _max_interpacket['reverse']:
+                    _max_interpacket['reverse'] = _interpacket_interval
+                elif _interpacket_interval > _max_interpacket['reverse']:
+                    _max_interpacket['reverse'] = _interpacket_interval
+                else:
+                    #*** nothing to see here, move on
+                    pass
+                _previous_reverse = _arrival_time
+            elif _direction == 'forward':
+                #*** First time we've seen a forward packet so set previous for next time
+                _previous_forward = _arrival_time
+            elif _direction == 'reverse':
+                #*** First time we've seen a reverse packet so set previous for next time
+                _previous_reverse = _arrival_time
+            else:
+                #*** should never hit this...
+                self.logger.error("Strange condition encountered")
+        if not _max_interpacket:
+            return 0
+        else:
+            _max_interpacket['both'] = max(list(_max_interpacket.values()))
+            return _max_interpacket
+
+    def _udp_calc_min_interpacket_interval(self, table_ref):
+        """
+        Review packet arrival times for each direction in 
+        a flow and return the size of the smallest inter-
+        packet interval (from either direction) in seconds
+        """
+        _min_interpacket = nmisc.AutoVivification()
+        _min_interpacket['forward'] = 0
+        _min_interpacket['reverse'] = 0
+        _previous_reverse = 0
+        _previous_forward = 0
+        for _packet_number in self._fcip_table[table_ref]["arrival_time"]:
+            _arrival_time = self._fcip_table[table_ref]["arrival_time"][_packet_number]
+            _direction = self._fcip_table[table_ref]["direction"][_packet_number]
+            if _direction == 'forward' and _previous_forward:
+                _interpacket_interval = _arrival_time - _previous_forward
+                if not _min_interpacket['forward']:
+                    _min_interpacket['forward'] = _interpacket_interval
+                elif _interpacket_interval < _min_interpacket['forward']:
+                    _min_interpacket['forward'] = _interpacket_interval
+                else:
+                    #*** nothing to see here, move on
+                    pass
+                _previous_forward = _arrival_time
+            elif _direction == 'reverse' and _previous_reverse:
+                _interpacket_interval = _arrival_time - _previous_reverse
+                if not _min_interpacket['reverse']:
+                    _min_interpacket['reverse'] = _interpacket_interval
+                elif _interpacket_interval < _min_interpacket['reverse']:
+                    _min_interpacket['reverse'] = _interpacket_interval
+                else:
+                    #*** nothing to see here, move on
+                    pass
+                _previous_reverse = _arrival_time
+            elif _direction == 'forward':
+                #*** First time we've seen a forward packet so set previous for next time
+                _previous_forward = _arrival_time
+            elif _direction == 'reverse':
+                #*** First time we've seen a reverse packet so set previous for next time
+                _previous_reverse = _arrival_time
+            else:
+                #*** should never hit this...
+                self.logger.error("Strange condition encountered")
+        if not _min_interpacket:
+            return 0
+        else:
+            _min_interpacket['both'] = min(list(_min_interpacket.values()))
+            return _min_interpacket

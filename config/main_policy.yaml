@@ -1,4 +1,4 @@
-#*** Main Policy for nmeta
+#*** Example Identity Main Policy
 #*** Written in YAML
 #
 tc_rules:
@@ -13,16 +13,14 @@ tc_rules:
           actions:
               set_qos_tag: QoS_treatment=system_priority
               set_desc_tag: description="OpenFlow Protocol Traffic"
-        - comment: YouTube Video Streaming
-          match_type: all
+        - comment: Basic Statistical Classifier
+          match_type: any
           conditions_list:
               - match_type: any
-                tcp_src: 443
-                tcp_dst: 443
-              - match_type: any
-                identity_service_dns_re: '.*\.youtube\.com'
-          actions:
-              set_desc_tag: description="YouTube Streaming Traffic"
+                # statistical_qos_bandwidth_1: off
+                statistical_voip_p2p: on
+          actions: 
+              pass_return_tags: true
 #
 identity:
     # Control how identity information is collected
@@ -30,15 +28,14 @@ identity:
     # ports on which to run it
     #
     # Turn this on to collect ARP MAC address to IPv4 address mappings:
-    arp: 1
+    arp: 0
     #
     # Turn this on to collect Link Layer Discovery Protocol information:
-    lldp: 1
+    lldp: 0
     #
     # Turn this on to collect DNS reply data matching services to IP addresses:
-    dns: 1
+    dns: 0
     #
     # Turn this on to collect DHCP information about address allocations and
     # hostnames:
-    dhcp: 1
-
+    dhcp: 0
